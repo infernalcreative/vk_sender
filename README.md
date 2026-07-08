@@ -1,1 +1,14 @@
 # vk_sender
+
+*docker build . -t vk_sender*
+
+**nginx**
+
+> location /vk-alerts { \
+>    proxy_pass http://vk_sender:8000/notify; \
+>    proxy_set_header X-VK-Token "TOKEN_ALERTS"; \
+>    proxy_set_header X-Chat-ID "22222"; \
+>    proxy_request_buffering off; \
+>    proxy_http_version 1.1; \
+> }
+> 
