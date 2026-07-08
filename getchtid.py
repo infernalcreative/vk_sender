@@ -1,3 +1,4 @@
+#Получить id чата сообщества
 import vk_api
 
 token = "vk1.token..." # << VK token
