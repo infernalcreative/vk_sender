@@ -16,8 +16,11 @@ from tenacity import (
 )
 from PIL import Image
 
+DEBUG_VK = os.getenv("DEBUG_VK", "false").lower() in ("true", "1", "yes")
+LOG_LEVEL = logging.DEBUG if DEBUG_VK else logging.INFO
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
@@ -27,10 +30,8 @@ app = FastAPI()
 MAX_VK_MESSAGE_LENGTH = 4048
 MAX_FILE_SIZE_MB = 10
 
-DEBUG_VK = os.getenv("DEBUG_VK", "false").lower() in ("true", "1", "yes")
-
 if DEBUG_VK:
-    logger.warning("DEBUG_VK is ENABLED: VK API raw responses will be logged.")
+    logger.warning("DEBUG_VK is ENABLED: Extended VK API logs and raw responses WILL be printed.")
 
 def log_debug(msg, data=None):
     if not DEBUG_VK:
@@ -38,9 +39,13 @@ def log_debug(msg, data=None):
     if data is not None:
         import json
         try:
-            serialized = json.dumps(data, ensure_ascii=False)
-            truncated = serialized[:2048] + "..." if len(serialized) > 2048 else serialized
-            logger.debug(f"{msg}: {truncated}")
+            if isinstance(data, (dict, list)):
+                serialized = json.dumps(data, ensure_ascii=False, indent=2)
+            else:
+                serialized = str(data)
+            # Ограничиваем длину вывода в лог, чтобы не перегружать консоль
+            truncated = serialized[:4096] + "\n... [TRUNCATED]" if len(serialized) > 4096 else serialized
+            logger.debug(f"{msg}:\n{truncated}")
         except Exception:
             logger.debug(f"{msg}: [non-serializable data]")
     else:
@@ -57,7 +62,6 @@ DEFAULT_USER_AGENT = (
 @retry(
     stop=stop_after_attempt(4),
     wait=wait_exponential(multiplier=2, min=4, max=30),
-    # Повторяем попытку при сетевых сбоях и таймаутах (включая 504 Gateway Timeout от серверов ВК)
     retry=retry_if_exception_type((
         httpx.ReadTimeout,
         httpx.ConnectError,
@@ -74,10 +78,27 @@ async def upload_file_to_vk_upload_url(upload_url, photo_file):
         resp = await client.post(upload_url, files=photo_file, headers=headers)
         duration = time.time() - start_time
         logger.info(f"Upload completed in {duration:.2f}s, status={resp.status_code}")
+        
+        log_debug("VK Upload Response Headers", dict(resp.headers))
+        log_debug("VK Upload Raw Response Body", resp.text)
 
         if resp.status_code != 200:
             raise ValueError(f"Upload failed with status {resp.status_code}")
-        return resp
+
+        try:
+            upload_data = resp.json()
+        except Exception as e:
+            logger.error(f"Failed to parse VK response as JSON. Raw body: {resp.text}")
+            raise ValueError(f"Upload response is not valid JSON: {e}")
+
+        required_keys = ["server", "photo", "hash"]
+        missing = [k for k in required_keys if k not in upload_data or not upload_data[k] or upload_data[k] == "[]"]
+
+        if missing:
+            logger.warning(f"VK uploaded fields missing or empty: {missing}. Full response was: {upload_data}")
+            raise ValueError(f"VK response validation failed. Missing: {missing}")
+
+        return upload_data
 
 def process_and_compress_image(file_data: bytes) -> bytes:
     """CPU-bound операция: сжатие изображения."""
@@ -110,7 +131,6 @@ async def notify(
     except ValueError:
         raise HTTPException(status_code=400, detail="'X-Chat-ID' header must be a valid integer")
 
-    # Формируем peer_id строго по правилам VK API для групповых бесед
     peer_id = 2000000000 + chat_id_int
 
     if len(message) > MAX_VK_MESSAGE_LENGTH:
@@ -141,7 +161,7 @@ async def notify(
             file_size_mb = len(file_data) / (1024 * 1024)
             logger.info(f"Downloaded file size: {file_size_mb:.2f} MB")
 
-            # Сжимаем изображение, только если оно весит больше 1.5 МБ
+            # Сжимаем только если картинка больше 1.5 МБ
             if len(file_data) > 1.5 * 1024 * 1024:
                 logger.info("Applying compression to image...")
                 file_data = await asyncio.to_thread(process_and_compress_image, file_data)
@@ -157,14 +177,13 @@ async def notify(
         except HTTPException:
             raise
         except Exception as e:
-            logger.exception(f"Failed to download or compress attachment: {e}")
+            logger.exception(f"Failed to download or process attachment: {e}")
             raise HTTPException(status_code=502, detail=f"Failed to fetch attachment from camera: {e}")
 
     # 2. Загрузка фото на сервера VK
     if file_data is not None:
         try:
             logger.info("Calling getMessagesUploadServer...")
-            # Строгое приведение типов под требования integer из документации
             upload_server = await asyncio.to_thread(
                 vk.photos.getMessagesUploadServer,
                 peer_id=int(peer_id)
@@ -182,41 +201,28 @@ async def notify(
             photo_file = {"file": ("image.jpg", file_data, "image/jpeg")}
 
             logger.info("Uploading photo to VK upload_url...")
-            upload_resp = await upload_file_to_vk_upload_url(upload_url, photo_file)
-            log_debug(f"Upload POST status: {upload_resp.status_code}", upload_resp.text)
+            # Валидация ответа и дебаг-логи выполняются внутри функции с ретраями
+            upload_data = await upload_file_to_vk_upload_url(upload_url, photo_file)
 
-            try:
-                upload_data = upload_resp.json()
-            except Exception as e:
-                logger.error(f"Upload response is not valid JSON: {e}")
-                upload_data = None
+            logger.info("Calling saveMessagesPhoto...")
+            save_resp = await asyncio.to_thread(
+                vk.photos.saveMessagesPhoto,
+                server=int(upload_data["server"]),
+                photo=str(upload_data["photo"]),
+                hash=str(upload_data["hash"])
+            )
+            log_debug("saveMessagesPhoto response", save_resp)
 
-            if upload_data:
-                required_keys = ["server", "photo", "hash"]
-                missing = [k for k in required_keys if k not in upload_data or not upload_data[k]]
-
-                if missing:
-                    logger.error(f"VK upload response is missing required fields: {missing}")
-                    raise HTTPException(status_code=502, detail="VK upload response fields are missing")
-                else:
-                    logger.info("Calling saveMessagesPhoto...")
-                    # Строгое приведение типов под спецификацию photos.saveMessagesPhoto
-                    save_resp = await asyncio.to_thread(
-                        vk.photos.saveMessagesPhoto,
-                        server=int(upload_data["server"]),
-                        photo=str(upload_data["photo"]),
-                        hash=str(upload_data["hash"])
-                    )
-
-                    if save_resp and len(save_resp) > 0:
-                        photo = save_resp[0]
-                        attachment_str = f"photo{photo['owner_id']}_{photo['id']}"
-                        logger.info(f"Attachment uploaded successfully: {attachment_str}")
-                    else:
-                        logger.warning("saveMessagesPhoto returned empty result")
-                        raise HTTPException(status_code=502, detail="VK save photo returned empty result")
+            if save_resp and len(save_resp) > 0:
+                photo = save_resp[0]
+                attachment_str = f"photo{photo['owner_id']}_{photo['id']}"
+                logger.info(f"Attachment uploaded successfully: {attachment_str}")
+            else:
+                logger.warning(f"saveMessagesPhoto returned empty result. Full response: {save_resp}")
+                raise HTTPException(status_code=502, detail="VK save photo returned empty result")
 
         except ApiError as e:
+            log_debug("VK ApiError full dump", {"code": e.code, "message": str(e), "request": e.request})
             if e.code == 901:
                 logger.error(f"VK Error 901: Can't send messages for users without permission (peer_id: {peer_id})")
                 raise HTTPException(status_code=403, detail="VK Error 901: No permission to send message")
@@ -239,7 +245,6 @@ async def notify(
         if attachment_str:
             send_kwargs["attachment"] = attachment_str
         elif attach_url:
-            # Картинка была запрошена, но не сформировалась — блокируем отправку
             raise HTTPException(status_code=500, detail="Attachment was requested but could not be processed")
 
         logger.info("Sending message to VK...")
@@ -247,6 +252,7 @@ async def notify(
         return {"status": "ok", "chat_id": chat_id_int, "has_attachment": bool(attachment_str)}
 
     except ApiError as e:
+        log_debug("VK ApiError send dump", {"code": e.code, "message": str(e)})
         logger.exception(f"Failed to send message to VK (API Error): {e}")
         raise HTTPException(status_code=500, detail=f"VK API error during messages.send: {e}")
     except HTTPException:
@@ -254,4 +260,4 @@ async def notify(
     except Exception as e:
         logger.exception("Unexpected error while sending message")
         raise HTTPException(status_code=500, detail="Failed to send to VK")
-        
+                
