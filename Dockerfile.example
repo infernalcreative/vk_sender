@@ -1,0 +1,20 @@
+services:
+  vk_sender:
+    image: vk_sender
+    container_name: vk_sender
+    mem_limit: 64m
+    #mem_reservation: 128m
+    memswap_limit: 256m
+    cpus: "1"
+    restart: unless-stopped
+    environment:
+      - DEBUG_VK=false
+      - TZ=Europe/Moscow
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/notify"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      
