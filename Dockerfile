@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-RUN pip install --no-cache-dir fastapi uvicorn vk_api httpx
+RUN pip install --no-cache-dir fastapi uvicorn vk_api httpx tenacity pillow
 
 COPY vk_sender.py /app/vk_sender.py
 WORKDIR /app
