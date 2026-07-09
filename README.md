@@ -25,3 +25,7 @@
 >    proxy_set_header Content-Type "application/json"; \
 >
 >}
+
+---
+**Copyright © 2026 Вайбкодинг.**  
+ИИ [Алиса](https://alice.yandex.ru).
