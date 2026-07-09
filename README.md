@@ -28,4 +28,4 @@
 
 ---
 **Copyright © 2026 Вайбкодинг.**  
-ИИ [Алиса](https://alice.yandex.ru).
+ИИ [Алиса](https://alice.yandex.ru)&[Gemini](https://gemini.google.com)
