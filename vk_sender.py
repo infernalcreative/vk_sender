@@ -57,6 +57,7 @@ DEFAULT_USER_AGENT = (
 @retry(
     stop=stop_after_attempt(4),
     wait=wait_exponential(multiplier=2, min=4, max=30),
+    # Повторяем попытку при сетевых сбоях и таймаутах (включая 504 Gateway Timeout от серверов ВК)
     retry=retry_if_exception_type((
         httpx.ReadTimeout,
         httpx.ConnectError,
@@ -81,7 +82,6 @@ async def upload_file_to_vk_upload_url(upload_url, photo_file):
 def process_and_compress_image(file_data: bytes) -> bytes:
     """CPU-bound операция: сжатие изображения."""
     img = Image.open(io.BytesIO(file_data))
-    # Сохраняем соотношение сторон, уменьшая до макс. 1280×720
     img.thumbnail((1280, 720))
     buf = io.BytesIO()
     img.save(buf, format='JPEG', quality=85)
@@ -110,6 +110,7 @@ async def notify(
     except ValueError:
         raise HTTPException(status_code=400, detail="'X-Chat-ID' header must be a valid integer")
 
+    # Формируем peer_id строго по правилам VK API для групповых бесед
     peer_id = 2000000000 + chat_id_int
 
     if len(message) > MAX_VK_MESSAGE_LENGTH:
@@ -140,7 +141,7 @@ async def notify(
             file_size_mb = len(file_data) / (1024 * 1024)
             logger.info(f"Downloaded file size: {file_size_mb:.2f} MB")
 
-            # Сжимаем только если файл тяжёлый (> 1.5 МБ)
+            # Сжимаем изображение, только если оно весит больше 1.5 МБ
             if len(file_data) > 1.5 * 1024 * 1024:
                 logger.info("Applying compression to image...")
                 file_data = await asyncio.to_thread(process_and_compress_image, file_data)
@@ -150,18 +151,20 @@ async def notify(
                 logger.info("Image is small enough, skipping compression.")
 
             if len(file_data) > MAX_FILE_SIZE_MB * 1024 * 1024:
-                logger.warning(f"File still too large. Sending text-only.")
-                file_data = None
+                logger.error("File is too large even after compression limits.")
+                raise HTTPException(status_code=413, detail="File size exceeds maximum limits")
+
+        except HTTPException:
+            raise
         except Exception as e:
             logger.exception(f"Failed to download or compress attachment: {e}")
-            logger.warning("Attachment processing failed; sending text-only message")
-            file_data = None
+            raise HTTPException(status_code=502, detail=f"Failed to fetch attachment from camera: {e}")
 
     # 2. Загрузка фото на сервера VK
     if file_data is not None:
         try:
             logger.info("Calling getMessagesUploadServer...")
-            # ИСПРАВЛЕНО: await asyncio.to_thread(...) отдельно
+            # Строгое приведение типов под требования integer из документации
             upload_server = await asyncio.to_thread(
                 vk.photos.getMessagesUploadServer,
                 peer_id=int(peer_id)
@@ -194,8 +197,10 @@ async def notify(
 
                 if missing:
                     logger.error(f"VK upload response is missing required fields: {missing}")
+                    raise HTTPException(status_code=502, detail="VK upload response fields are missing")
                 else:
                     logger.info("Calling saveMessagesPhoto...")
+                    # Строгое приведение типов под спецификацию photos.saveMessagesPhoto
                     save_resp = await asyncio.to_thread(
                         vk.photos.saveMessagesPhoto,
                         server=int(upload_data["server"]),
@@ -209,17 +214,20 @@ async def notify(
                         logger.info(f"Attachment uploaded successfully: {attachment_str}")
                     else:
                         logger.warning("saveMessagesPhoto returned empty result")
+                        raise HTTPException(status_code=502, detail="VK save photo returned empty result")
 
         except ApiError as e:
             if e.code == 901:
                 logger.error(f"VK Error 901: Can't send messages for users without permission (peer_id: {peer_id})")
+                raise HTTPException(status_code=403, detail="VK Error 901: No permission to send message")
             else:
                 logger.exception(f"VK API error while processing attachment: {e}")
-            log_debug("ApiError details", str(e))
-            logger.warning("Attachment failed; sending text-only message")
+                raise HTTPException(status_code=502, detail=f"VK API error during attachment save: {e}")
+        except HTTPException:
+            raise
         except Exception as e:
             logger.exception(f"Unexpected error processing attachment: {e}")
-            logger.warning("Attachment failed; sending text-only message")
+            raise HTTPException(status_code=500, detail="Internal error during attachment upload")
 
     # 3. Отправка сообщения
     try:
@@ -230,6 +238,9 @@ async def notify(
         }
         if attachment_str:
             send_kwargs["attachment"] = attachment_str
+        elif attach_url:
+            # Картинка была запрошена, но не сформировалась — блокируем отправку
+            raise HTTPException(status_code=500, detail="Attachment was requested but could not be processed")
 
         logger.info("Sending message to VK...")
         await asyncio.to_thread(vk.messages.send, **send_kwargs)
@@ -237,7 +248,9 @@ async def notify(
 
     except ApiError as e:
         logger.exception(f"Failed to send message to VK (API Error): {e}")
-        raise HTTPException(status_code=500, detail=f"VK API error: {e}")
+        raise HTTPException(status_code=500, detail=f"VK API error during messages.send: {e}")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Unexpected error while sending message")
         raise HTTPException(status_code=500, detail="Failed to send to VK")
