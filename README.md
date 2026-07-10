@@ -26,6 +26,9 @@
 >
 >}
 
+> curl -X POST -H "Content-Type: application/json" -d '{"message":"Сработала тревога на датчике движения!"}'
+> http://vk_sender/vk-alerts
+
 ---
 **Copyright © 2026 Вайбкодинг.**  
 ИИ [Алиса](https://alice.yandex.ru)&[Gemini](https://gemini.google.com)
